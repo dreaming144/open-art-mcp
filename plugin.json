@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "open-art-mcp",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Read-only open-access art search for The Met, Cleveland Museum of Art, the Art Institute of Chicago, the Rijksmuseum and the V&A, plus openly licensed images from Openverse. Normalized results with a licence field on every item (public domain / CC0 flag, rights text, attribution, image URLs). No keys.",
   "author": {
     "name": "Chris R"

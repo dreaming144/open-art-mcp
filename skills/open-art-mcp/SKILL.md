@@ -49,11 +49,12 @@ Read-only: every tool does GET requests to public museum APIs. No keys, no accou
 ## Gotchas
 
 - **Met search returns ids only**; the tool fetches each object to show licence info (1 request per result, so `limit` max 25 when hydrating). `openAccessOnly` hides non-public-domain results after fetching, so a page can have fewer rows than `limit`; page with `offset`. `hasImage` does not guarantee public domain.
+- **Rijksmuseum search** with `openAccessOnly` hydrates extra ids from the same 100-id page (up to 3×`limit`) to fill `limit`; continue with `offset=nextOffset`, then `nextPageToken`.
 - Met `/v1.1/search` only reaches the first 10,000 hits (`offset + limit <= 10000`). `dateBegin` and `dateEnd` must be used together.
 - Cleveland has no departments endpoint; the department list is static from its docs.
 - V&A pages start at 1, `pageSize` max 100. V&A asks apps to display images from the API-provided URL rather than hosting copies.
 - Rijksmuseum search has **no free-text q**: use `title`, `creator`, `description`, `type`, etc. Each object costs one request (records are big), so `limit` is 1-10. A Rijksmuseum record's metadata is CC0 but that says nothing about the image: gating uses the image rights only.
-- Openverse is verified live but can be slow on new searches. Expect possible timeouts; report them rather than retrying in a loop. Anonymous quota is 20 requests/minute and **200/day**; `pageSize` max 20. Always show `license.attribution` (and `license.requirement` for non-CC0/PDM). Downloads only fetch the Openverse thumbnail.
+- Openverse is verified live but can be slow on new searches. Expect possible timeouts; report them rather than retrying in a loop. Anonymous quota is 20 requests/minute and **200/day**; `pageSize` max 20. Always show `license.attribution` (and `license.requirement` for non-CC0/PDM). Downloads only fetch the Openverse thumbnail; `THUMBNAIL_UNAVAILABLE` means Openverse has no thumbnail for it, so give the user `originalUrl` (with attribution) instead.
 - AIC: `page` starts at 1, `limit` max 100, `page * limit <= 10000`; `departmentId` is a `PC-` id from `oa_aic_list_departments`.
 - Requests are paced per museum (Met ~10/s, Cleveland ~4/s, V&A 2/s, Rijksmuseum 2/s, AIC 1/s because AIC allows 60/min, Openverse 1 per 3 s). AIC is the slow one: keep AIC pages small. If you get `RATE_LIMITED`, wait; do not loop.
 - Errors come back as `{ error: { code, message } }` with `isError: true` (`INVALID_INPUT`, `NOT_FOUND`, `RATE_LIMITED`, `TIMEOUT`, `RESPONSE_TOO_LARGE`, `NOT_OPEN_ACCESS`, ...). Fix the input; do not retry blindly.

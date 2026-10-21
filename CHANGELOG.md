@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1
+
+- Fixed `oa_download_image` for Openverse: `/thumb/` answers a bare `Accept: image/*` with HTTP 406. Image downloads now send `Accept: image/*,*/*;q=0.8` (the content type is still checked). The 0.3.0 live smoke never downloaded from Openverse, so it missed this. It now downloads one Openverse thumbnail, and a 406 fails the run instead of being skipped.
+- When Openverse cannot build a thumbnail (HTTP 424, "Thumbnail unavailable from provider"; seen on some Wikimedia images), the download returns `THUMBNAIL_UNAVAILABLE` with `originalUrl`. Originals live on third-party hosts (Flickr, Wikimedia and others), so the allow-list was not widened and they are not fetched.
+- Rijksmuseum search with `openAccessOnly=true` keeps hydrating ids from the same 100-id page until `limit` is filled. It stops after at most 3×`limit` lookups and returns `nextOffset`. Before this fix, items with no image or restricted rights were dropped without being replaced (e.g. `landschap`, limit 8, returned 4).
+- V&A search: records with an empty `_primaryTitle` now use `objectType` as the title.
+- Checked, no change needed: Cleveland already maps `creators[].description` to `artist` (the empty ones are anonymous works where the API's `creators` list is `[]`). Openverse exposes no creation date (`indexed_on` is the indexing date), so `date` stays null. V&A images are marked "© Victoria and Albert Museum, London" in the API, so V&A stays reference-only.
+
 ## 0.3.0
 
 - Added the Rijksmuseum (data.rijksmuseum.nl Search API + id.rijksmuseum.nl Linked Art resolver, keyless): `oa_rijks_search`, `oa_rijks_get_object`. Open access only when the image rights statement is the Public Domain Mark or CC0 (metadata CC0 is ignored for gating). IIIF images from `iiif.micr.io`.

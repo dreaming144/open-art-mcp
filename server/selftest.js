@@ -75,8 +75,10 @@ const ovPdm = { ...ovCc0, id: "1bff3595-8168-440b-83ff-7a80b65dea42", license: "
 
 const JPEG = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(2048, 7)]);
 
+const ovNoThumb = { ...ovCc0, id: "3dff3595-8168-440b-83ff-7a80b65dea42", thumbnail: "https://api.openverse.org/v1/images/3dff3595-8168-440b-83ff-7a80b65dea42/thumb/", url: "https://upload.wikimedia.org/wikipedia/commons/x/xx/Example.jpg" };
+const rijksMany = (n) => ({ ...RIJKS_SEARCH, orderedItems: Array.from({ length: n }, (_, i) => ({ id: `https://id.rijksmuseum.nl/${i % 2 ? "200107928" : "200496110"}`, type: "HumanMadeObject" })) });
 function router() {
-  return (url) => {
+  return (url, init = {}) => {
     const u = new URL(url);
     if (u.hostname === "collectionapi.metmuseum.org") {
       if (u.pathname === "/public/collection/v1.1/search") {
@@ -111,6 +113,7 @@ function router() {
     }
     if (u.hostname === "data.rijksmuseum.nl" && u.pathname === "/search/collection") {
       if (u.searchParams.get("objectNumber") === "SK-C-5") return { json: { ...RIJKS_SEARCH, partOf: { ...RIJKS_SEARCH.partOf, totalItems: 1 }, orderedItems: [{ id: "https://id.rijksmuseum.nl/200107928", type: "HumanMadeObject" }] } };
+      if (u.searchParams.get("title") === "many") return { json: rijksMany(20) };
       if (u.searchParams.get("objectNumber")) return { json: { ...RIJKS_SEARCH, partOf: { ...RIJKS_SEARCH.partOf, totalItems: 0 }, orderedItems: [] } };
       return { json: { ...RIJKS_SEARCH, orderedItems: [{ id: "https://id.rijksmuseum.nl/200107928", type: "HumanMadeObject" }, { id: "https://id.rijksmuseum.nl/200496110", type: "HumanMadeObject" }, { id: "https://evil.example/1", type: "HumanMadeObject" }] } };
     }
@@ -128,8 +131,14 @@ function router() {
         return { json: { result_count: results.length, page_count: 1, page_size: results.length, page: 1, results } };
       }
       const m = /^\/v1\/images\/([0-9a-f-]{36})\/$/.exec(u.pathname);
-      if (m) { const r = [ovCc0, ovPdm, OV_SEARCH.results[0]].find((x) => x.id === m[1]); return r ? { json: r } : { status: 404, json: { detail: "Not found." } }; }
-      if (/\/thumb\/$/.test(u.pathname)) return { body: JPEG, headers: { "content-type": "image/jpeg" } };
+      if (m) { const r = [ovCc0, ovPdm, ovNoThumb, OV_SEARCH.results[0]].find((x) => x.id === m[1]); return r ? { json: r } : { status: 404, json: { detail: "Not found." } }; }
+      if (/\/thumb\/$/.test(u.pathname)) {
+        // Mirrors live behaviour (2026-10-21): a bare "Accept: image/*" or JSON-only Accept gets 406; a provider-less thumbnail gets 424.
+        const acc = String(init.headers?.Accept || "");
+        if (!/\*\/\*/.test(acc)) return { status: 406, json: { detail: "Could not satisfy the request Accept header." } };
+        if (u.pathname.includes(ovNoThumb.id)) return { status: 424, json: { detail: "Thumbnail unavailable from provider." } };
+        return { body: JPEG, headers: { "content-type": "image/jpeg" } };
+      }
     }
     if (u.hostname === "www.artic.edu" && u.pathname.startsWith("/iiif/2/")) return { body: JPEG, headers: { "content-type": "image/jpeg" } };
     if (u.hostname === "images.metmuseum.org" || u.hostname === "openaccess-cdn.clevelandart.org") return { body: JPEG, headers: { "content-type": "image/jpeg" } };
@@ -336,7 +345,7 @@ await t("met search: uses /v1.1/search only (never /v1/search), hydrates, hides 
   assert.deepEqual(r.data.results.map((x) => x.id), ["101", "103"], "102 is not public domain");
   assert.ok(r.data.results.every((x) => x.license.openAccess && x.license.reuse === "direct-reuse-ok"));
   assert.equal(r.data.total, 3);
-  for (const c of calls) { assert.equal(c.init.method, "GET"); assert.match(c.init.headers["User-Agent"], /^open-art-mcp\/0\.3\.0 \(/); assert.equal(c.init.body, undefined); }
+  for (const c of calls) { assert.equal(c.init.method, "GET"); assert.match(c.init.headers["User-Agent"], /^open-art-mcp\/0\.3\.1 \(/); assert.equal(c.init.body, undefined); }
 });
 await t("met search: openAccessOnly=false keeps non-public-domain items flagged reference-only", async () => {
   mock(router());
@@ -482,7 +491,7 @@ await t("pacing: per-museum minimum interval is honoured; museums do not block e
   assert.ok(1000 / d.met.minIntervalMs <= 80, "Met stays far below its documented 80 req/s");
 });
 await t("user-agent is descriptive; OPEN_ART_CONTACT is appended only when it is clean", () => {
-  assert.match(M.userAgent(), /open-art-mcp\/0\.3\.0 \(read-only MCP plugin/);
+  assert.match(M.userAgent(), /open-art-mcp\/0\.3\.1 \(read-only MCP plugin/);
   process.env.OPEN_ART_CONTACT = "https://example.org/x"; assert.match(M.userAgent(), /contact: https:\/\/example\.org\/x$/);
   process.env.OPEN_ART_CONTACT = "bad\r\nX-Evil: 1"; assert.doesNotMatch(M.userAgent(), /Evil/);
   delete process.env.OPEN_ART_CONTACT;
@@ -549,7 +558,7 @@ await t("aic: get artwork normalizes live shape; is_public_domain=true -> open a
   assert.equal(x.images.web, "https://www.artic.edu/iiif/2/2d484387-2509-5e8e-2c43-22f9981972eb/full/843,/0/default.jpg");
   assert.match(x.images.large, /\/full\/1686,\/0\/default\.jpg$/); assert.equal(x.images.additional.length, 1, "invalid alt image id dropped");
   assert.equal(x.description, "Dots & dashes."); assert.equal(x.accessionNumber, "1926.224"); assert.equal(x.url, "https://www.artic.edu/artworks/27992"); assert.deepEqual(x.tags, ["oil on canvas", "Pointillism", "painting"]);
-  assert.ok(calls[0].url.includes("fields=")); assert.ok(calls[0].init.headers["AIC-User-Agent"].startsWith("open-art-mcp/0.3.0"));
+  assert.ok(calls[0].url.includes("fields=")); assert.ok(calls[0].init.headers["AIC-User-Agent"].startsWith("open-art-mcp/0.3.1"));
 });
 await t("aic: not public domain -> reference only; best_image_url withholds URL; download refused", async () => {
   mock(router()); const r = await call("oa_aic_get_artwork", { id: "28067" });
@@ -691,6 +700,39 @@ await t("openverse: only /v1/images/ on api.openverse.org; encoded paths refused
 await t("status: no network, reports caps and pacing", async () => {
   mock(router()); const r = await call("oa_status", {});
   assert.equal(calls.length, 0); assert.equal(r.data.caps.maxResponseBytes, 10485760); assert.equal(r.data.caps.httpTimeoutMs, 30000); assert.ok(r.data.museums.met.documentedLimit.includes("80")); assert.match(r.data.licencePolicy, /reference only/i);
+});
+
+// ===== 0.3.1 regressions =====================================================
+await t("0.3.1 openverse: download sends an Accept that /thumb/ satisfies (image/* plus */* fallback), never JSON", async () => {
+  mock(router()); const r = await call("oa_download_image", { museum: "openverse", id: ovCc0.id, directory: path.join(tmp, "ov031"), confirm: true });
+  assert.equal(r.isError, false, JSON.stringify(r.data)); const th = calls.find((c) => c.url.endsWith("/thumb/"));
+  assert.equal(th.init.headers.Accept, M.DOWNLOAD_ACCEPT); assert.match(th.init.headers.Accept, /image\/\*/); assert.doesNotMatch(th.init.headers.Accept, /json/);
+  assert.ok(fs.existsSync(r.data.written[0]) && fs.existsSync(r.data.written[1]));
+});
+await t("0.3.1 openverse: HTTP 424 -> THUMBNAIL_UNAVAILABLE with originalUrl, and NO request to the third-party original host", async () => {
+  mock(router()); const r = await call("oa_download_image", { museum: "openverse", id: ovNoThumb.id, directory: path.join(tmp, "ov424"), confirm: true });
+  assert.equal(r.data.error.code, "THUMBNAIL_UNAVAILABLE"); assert.equal(r.data.error.originalUrl, ovNoThumb.url);
+  assert.ok(calls.every((c) => new URL(c.url).hostname === "api.openverse.org"), urls().join());
+  await assert.rejects(() => M.httpGet(ovNoThumb.url), (e) => e.code === "HOST_NOT_ALLOWED");
+});
+await t("0.3.1 rijks: openAccessOnly keeps hydrating within the page to fill limit, bounded by 3*limit, returns nextOffset", async () => {
+  mock(router()); const r = await call("oa_rijks_search", { title: "many", limit: 4 });
+  assert.equal(r.isError, false, JSON.stringify(r.data)); assert.equal(r.data.results.length, 4); assert.ok(r.data.results.every((x) => x.license.openAccess));
+  assert.equal(r.data.nextOffset, 8); assert.equal(calls.length, 1 + 8);
+  mock(router()); const r2 = await call("oa_rijks_search", { title: "nachtwacht", limit: 3 }); assert.equal(r2.data.results.length, 1); assert.equal(r2.data.nextOffset, null);
+  mock(router()); const r3 = await call("oa_rijks_search", { title: "many", limit: 10, openAccessOnly: false, hasImage: false }); assert.equal(r3.data.results.length, 10); assert.equal(calls.length, 11);
+});
+await t("0.3.1 V&A: empty _primaryTitle falls back to objectType; real titles kept", async () => {
+  assert.equal(M.normalizeVamSearchRecord({ systemNumber: "O478284", _primaryTitle: "", objectType: "Textile" }).title, "Textile");
+  assert.equal(M.normalizeVamSearchRecord({ systemNumber: "O1", _primaryTitle: "Dorset Landscape", objectType: "Landscape" }).title, "Dorset Landscape");
+  assert.equal(M.normalizeVamSearchRecord({ systemNumber: "O2", _primaryTitle: "" }).title, null);
+});
+await t("0.3.1 Cleveland: artist from creators[].description; empty creators -> null (not invented)", async () => {
+  assert.equal(M.normalizeCma({ id: 1, creators: [{ description: "Claude Monet (French, 1840-1926)" }] }).artist, "Claude Monet (French, 1840-1926)");
+  assert.equal(M.normalizeCma({ id: 2, creators: [] }).artist, null);
+});
+await t("0.3.1 Openverse: date stays null (API has no creation date; indexed_on is not mapped)", async () => {
+  assert.equal(M.normalizeOpenverse({ ...ovCc0, indexed_on: "2020-01-01T00:00:00Z" }).date, null);
 });
 
 globalThis.fetch = realFetch;

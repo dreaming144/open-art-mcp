@@ -11,7 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const VERSION = "0.3.0";
+export const VERSION = "0.3.1";
 export const SERVER_NAME = "open-art-mcp";
 
 // ---------------------------------------------------------------------------
@@ -502,7 +502,7 @@ export function normalizeVamSearchRecord(r) {
   return {
     museum: "vam",
     id: String(r.systemNumber),
-    title: nz(r._primaryTitle),
+    title: nz(r._primaryTitle) ?? nz(r.objectType), // V&A leaves _primaryTitle empty for many records; objectType is the V&A's own name for the object
     artist: nz(r._primaryMaker?.name),
     artistBio: null,
     date: nz(r._primaryDate),
@@ -853,6 +853,7 @@ async function aicSearch(a, ctx) {
   };
 }
 
+const RIJKS_FILL_FACTOR = 3;
 const RIJKS_FILTERS = ["title", "creator", "description", "type", "material", "technique", "creationDate", "aboutActor"];
 async function rijksSearch(a, ctx) {
   if (!RIJKS_FILTERS.some((k) => a[k] !== undefined) && a.pageToken === undefined) throw new ToolError("INVALID_INPUT", `Provide at least one of: ${RIJKS_FILTERS.join(", ")} (the Rijksmuseum search has no free-text q).`);
@@ -863,19 +864,24 @@ async function rijksSearch(a, ctx) {
   const j = await getJson(`${RIJKS_SEARCH}?${p.toString()}`, { ctx, accept: "application/ld+json, application/json" });
   const ids = (Array.isArray(j?.orderedItems) ? j.orderedItems : []).map((x) => /^https:\/\/id\.rijksmuseum\.nl\/([1-9]\d{4,11})$/.exec(String(x?.id || ""))?.[1]).filter(Boolean);
   const nextTok = (() => { try { const u = new URL(j?.next?.id); return u.hostname === "data.rijksmuseum.nl" ? u.searchParams.get("pageToken") : null; } catch { return null; } })();
-  const slice = ids.slice(a.offset, a.offset + a.limit);
-  const out = { museum: "rijks", total: Number(j?.partOf?.totalItems) || 0, pageIds: ids.length, offset: a.offset, limit: a.limit, nextPageToken: nextTok && RE_RIJKS_TOKEN.test(nextTok) ? nextTok : null, results: [], notes: [] };
-  let filtered = 0, skipped = 0;
-  for (const id of slice) {
+  // When openAccessOnly hides items, keep hydrating further ids from the SAME 100-id page (no extra search
+  // request) until `limit` is filled, within a budget of 3*limit hydrations. nextOffset says where to resume.
+  const budget = a.openAccessOnly ? a.limit * RIJKS_FILL_FACTOR : a.limit;
+  const out = { museum: "rijks", total: Number(j?.partOf?.totalItems) || 0, pageIds: ids.length, offset: a.offset, limit: a.limit, nextOffset: null, nextPageToken: nextTok && RE_RIJKS_TOKEN.test(nextTok) ? nextTok : null, results: [], notes: [] };
+  let filtered = 0, skipped = 0, i = a.offset;
+  for (; i < ids.length && i < a.offset + budget && out.results.length < a.limit; i++) {
+    const id = ids[i];
     try {
       const rec = await rijksFetchLod(id, ctx);
       if (a.openAccessOnly && !rec.license.openAccess) { filtered++; continue; }
       out.results.push(rec);
     } catch (e) { if (e instanceof ToolError && e.code === "NOT_FOUND") { skipped++; continue; } throw e; }
   }
-  if (filtered) out.notes.push(`${filtered} result(s) were not public domain / CC0 and were hidden (openAccessOnly=true).`);
+  out.nextOffset = i < ids.length ? i : null;
+  if (filtered) out.notes.push(`${filtered} result(s) were not public domain / CC0 (or had no image) and were hidden (openAccessOnly=true); further ids on this page were hydrated to fill the limit.`);
+  if (out.results.length < a.limit && i < ids.length) out.notes.push(`Fill budget (${budget} hydrations) reached with ${out.results.length}/${a.limit} results; call again with offset=${i} for more.`);
   if (skipped) out.notes.push(`${skipped} id(s) could not be fetched (404).`);
-  out.notes.push("Each search page holds up to 100 ids; results hydrate ids[offset..offset+limit). Raise offset to continue within the page, then use nextPageToken.");
+  out.notes.push("Each search page holds up to 100 ids; to fill the limit, lookups may cover up to 3x limit ids starting at offset, within the same 100-id page. Continue with offset=nextOffset within the page, then use nextPageToken.");
   return out;
 }
 
@@ -897,6 +903,7 @@ async function ovSearch(a, ctx) {
 // ---------------------------------------------------------------------------
 // Download path validation
 // ---------------------------------------------------------------------------
+export const DOWNLOAD_ACCEPT = "image/*,*/*;q=0.8";
 const DENY_TOP = new Set(["etc", "proc", "sys", "dev", "boot", "bin", "sbin", "lib", "lib32", "lib64", "libx32", "usr", "var", "run", "root", "snap", "srv"]);
 const PLUGIN_ROOT = (() => { const p = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."); try { return fs.realpathSync(p); } catch { return p; } })();
 
@@ -1187,7 +1194,13 @@ def("oa_download_image", "Download ONE open-access (public domain / CC0) image t
   const plan = { museum: rec.museum, id: rec.id, title: rec.title, imageUrl: url, directory: dir, filePrefix: base, license: rec.license };
   if (!a.confirm) return { dryRun: true, wouldWrite: [path.join(dir, `${base}.<ext>`), path.join(dir, `${base}.license.json`)], ...plan, next: "Call again with confirm=true to download." };
   const cap = Math.min(a.maxMegabytes, LIMITS.maxDownloadMegabytesCeiling) * 1024 * 1024;
-  const r = await httpGet(url, { ctx, accept: "image/*", maxBytes: cap });
+  // Accept: Openverse's /thumb/ answers a bare "image/*" with 406, so offer */* as a low-q fallback (content-type is still checked below).
+  let r;
+  try { r = await httpGet(url, { ctx, accept: DOWNLOAD_ACCEPT, maxBytes: cap }); }
+  catch (e) {
+    if (rec.museum === "openverse" && e instanceof ToolError && e.extra?.status === 424) throw new ToolError("THUMBNAIL_UNAVAILABLE", "Openverse could not build a thumbnail for this image (HTTP 424: provider unavailable). The original file is on a third-party host outside the allow-list, so it is not downloaded here; use oa_best_image_url (size=original) to get its URL.", { status: 424, originalUrl: rec.images.original });
+    throw e;
+  }
   const ctype = String(r.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
   const ext = EXT_BY_TYPE[ctype];
   if (!ext || ext === "tif") throw new ToolError("UNEXPECTED_CONTENT_TYPE", `Refusing content-type ${ctype || "(none)"}; expected a web image`);

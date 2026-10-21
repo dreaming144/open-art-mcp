@@ -38,10 +38,18 @@ const calls = [
   ["rijks_get_ref", "oa_rijks_get_object", { id: "200496110" }],
   ["best_rijks", "oa_best_image_url", { museum: "rijks", id: "SK-C-5", size: "web" }],
   ["ov_search", "oa_openverse_search", { q: "sunflower", pageSize: 3 }],
+  ["rijks_fill", "oa_rijks_search", { title: "landschap", limit: 8 }],
+  ["vam_textile", "oa_vam_search", { q: "textile", pageSize: 20 }],
+  ["cma_creator", "oa_cleveland_get_artwork", { id: "1958.39" }],
   ["ov_search_ref", "oa_openverse_search", { q: "sunflower", pageSize: 2, openAccessOnly: false }],
 ];
 if (withDownload) {
   calls.push(["download", "oa_download_image", { museum: "cleveland", id: "1958.39", directory: tmp, confirm: true, size: "web" }]);
+  // Openverse /thumb/ (added in 0.3.1: the 0.3.0 smoke never downloaded from Openverse, so the 406 went unseen).
+  // 0b69671c = Flickr-hosted PDM image whose thumbnail Openverse serves; 48884765 = Wikimedia CC0 image whose
+  // thumbnail Openverse currently cannot build (HTTP 424) -> must surface as THUMBNAIL_UNAVAILABLE, never 406.
+  calls.push(["download_ov", "oa_download_image", { museum: "openverse", id: "0b69671c-423a-48b9-9fb8-a5fffd7bb50b", directory: tmp, confirm: true, size: "web" }]);
+  calls.push(["download_ov_424", "oa_download_image", { museum: "openverse", id: "48884765-2346-4400-aa6a-2d72eeab0b21", directory: tmp, confirm: true, size: "web" }]);
   calls.push(["download_rijks", "oa_download_image", { museum: "rijks", id: "SK-C-5", directory: tmp, confirm: true, size: "web" }]);
 }
 
@@ -89,24 +97,33 @@ t("Rijksmuseum 200496110 (Karel Appel print) is In Copyright -> reference only",
 tOv("ov_search", "Openverse open-access search returns only CC0/PDM with attribution", () => { const d = ok("ov_search"); assert.ok(d.results.length >= 1); assert.ok(d.results.every((r) => ["cc0", "pdm"].includes(r.license.licenseCode) && r.license.openAccess && r.license.attribution && r.license.licenseUrl)); });
 tOv("ov_search_ref", "Openverse unfiltered search returns licence, URL, creator, attribution", () => { const d = ok("ov_search_ref"); assert.ok(d.results.length >= 1); assert.ok(d.results.every((r) => r.license.licenseCode && r.license.licenseUrl && "creator" in r.license && r.license.attribution)); });
 
+t("Rijksmuseum openAccessOnly search fills limit=8 for 'landschap' (0.3.1 fill)", () => { const d = ok("rijks_fill"); assert.equal(d.results.length, 8, JSON.stringify(d.notes)); assert.ok(d.results.every((r) => r.license.openAccess)); assert.ok(Number.isInteger(d.nextOffset)); });
+t("V&A search records always carry a title (objectType fallback for empty _primaryTitle)", () => { const d = ok("vam_textile"); assert.ok(d.results.length >= 5); assert.ok(d.results.every((r) => typeof r.title === "string" && r.title.length > 0)); });
+t("Cleveland creators[].description maps to artist when present (1958.39)", () => { const d = ok("cma_creator").result; assert.match(d.artist || "", /Monet/); });
 // Image URLs actually serve images (Range GET of the first KB only).
 const urls = { met: R.best_met.data.url, cma: R.best_cma.data.url, vam: R.best_vam.data.url, aic: R.best_aic.data.url, rijks: R.best_rijks.data.url };
 for (const [k, u] of Object.entries(urls)) {
   try {
-    const r = await fetch(u, { headers: { Range: "bytes=0-1023", "User-Agent": "open-art-mcp-live-smoke/0.3.0 (read-only)", "AIC-User-Agent": "open-art-mcp-live-smoke/0.3.0 (read-only)" } });
+    const r = await fetch(u, { headers: { Range: "bytes=0-1023", "User-Agent": "open-art-mcp-live-smoke/0.3.1 (read-only)", "AIC-User-Agent": "open-art-mcp-live-smoke/0.3.1 (read-only)" } });
     t(`image URL serves an image (${k})`, () => { assert.ok([200, 206].includes(r.status), `HTTP ${r.status}`); assert.match(r.headers.get("content-type") || "", /^image\//); });
     await r.body?.cancel();
   } catch (e) { t(`image URL serves an image (${k})`, () => { throw e; }); }
 }
 // The retired Met endpoint really is gone (documents why we use /v1.1).
 try {
-  const r = await fetch("https://collectionapi.metmuseum.org/public/collection/v1/search?q=cat", { headers: { "User-Agent": "open-art-mcp-live-smoke/0.3.0 (read-only)" } });
+  const r = await fetch("https://collectionapi.metmuseum.org/public/collection/v1/search?q=cat", { headers: { "User-Agent": "open-art-mcp-live-smoke/0.3.1 (read-only)" } });
   t("old Met /v1/search is retired (HTTP 410), confirming the /v1.1 choice", () => assert.equal(r.status, 410));
 } catch (e) { t("old Met /v1/search check", () => { throw e; }); }
 
 if (withDownload) {
   t("download wrote an image + license.json", () => { const d = ok("download"); assert.equal(d.written.length, 2); assert.ok(fs.statSync(d.written[0]).size > 1000); });
   t("Rijksmuseum download wrote an image + license.json", () => { const d = ok("download_rijks"); assert.equal(d.written.length, 2); assert.ok(fs.statSync(d.written[0]).size > 1000); });
+  // A 406 is HTTP-level (UPSTREAM_ERROR) and must FAIL here, not be skipped as "Openverse unavailable".
+  const ovNet = (k) => R[k].isError && ["TIMEOUT", "NETWORK_ERROR", "RATE_LIMITED", "UPSTREAM_UNAVAILABLE"].includes(R[k].data?.error?.code);
+  if (ovNet("download_ov")) { skip++; console.log("SKIP Openverse thumbnail download", R.download_ov.data.error.code); }
+  else t("Openverse thumbnail download wrote an image + license.json (no HTTP 406)", () => { const d = ok("download_ov"); assert.equal(d.written.length, 2); assert.ok(fs.statSync(d.written[0]).size > 1000); assert.ok(fs.existsSync(d.written[1])); });
+  if (ovNet("download_ov_424")) { skip++; console.log("SKIP Openverse 424 path", R.download_ov_424.data.error.code); }
+  else t("Openverse provider-less thumbnail -> THUMBNAIL_UNAVAILABLE with originalUrl (or succeeds), never 406", () => { const r = R.download_ov_424; assert.notEqual(r.data?.error?.status, 406, "HTTP 406 from /thumb/"); if (r.isError) { assert.equal(r.data.error.code, "THUMBNAIL_UNAVAILABLE", JSON.stringify(r.data).slice(0, 200)); assert.match(r.data.error.originalUrl, /^https:\/\//); } else assert.equal(r.data.written.length, 2); });
   fs.rmSync(tmp, { recursive: true, force: true });
 }
 console.log(`\n${pass} passed, ${fail} failed${skip ? `, ${skip} skipped (Openverse unavailable)` : ""}`);

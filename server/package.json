@@ -1,6 +1,6 @@
 {
   "name": "open-art-mcp",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "type": "module",
   "description": "Zero-dependency stdio MCP server for open-access art APIs (The Met, Cleveland Museum of Art, Art Institute of Chicago, Rijksmuseum, V&A, Openverse). Read-only, no keys.",
