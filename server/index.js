@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // open-art-mcp: zero-dependency stdio MCP server for open-access museum collection APIs
-// (The Met, Cleveland Museum of Art, V&A). Read-only GETs, no keys, no auth.
+// (The Met, Cleveland Museum of Art, V&A, Art Institute of Chicago, Rijksmuseum) plus Openverse. Read-only GETs, no keys, no auth.
 //
 // stdout carries JSON-RPC only. All logging goes to stderr.
 // Framing (inbound): NDJSON lines, OR "Content-Length: N" headers terminated by LF-LF or CRLF-CRLF.
@@ -11,7 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const VERSION = "0.1.0";
+export const VERSION = "0.3.0";
 export const SERVER_NAME = "open-art-mcp";
 
 // ---------------------------------------------------------------------------
@@ -57,6 +57,37 @@ export const MUSEUMS = Object.freeze({
     imageHosts: ["framemark.vam.ac.uk"],
     termsUrl: "https://www.vam.ac.uk/info/va-websites-terms-conditions",
   },
+  aic: {
+    id: "aic",
+    name: "Art Institute of Chicago",
+    documentedLimit: "60 requests/minute for anonymous users (AIC API docs); scrape single-threaded at <= 1 req/s",
+    minIntervalMs: 1000, // 1 req/s == the documented 60/min ceiling
+    apiHost: "api.artic.edu",
+    imageHosts: ["www.artic.edu"],
+    // www.artic.edu is also the public website: only the IIIF image service is allowed there.
+    hostPathPrefixes: { "www.artic.edu": ["/iiif/2/"] },
+    termsUrl: "https://www.artic.edu/terms",
+  },
+  rijks: {
+    id: "rijks",
+    name: "Rijksmuseum",
+    documentedLimit: "none documented (data.rijksmuseum.nl)",
+    minIntervalMs: 500, // 2 req/s; each object record is ~20-200 KB of Linked Art JSON-LD
+    apiHost: "data.rijksmuseum.nl",
+    imageHosts: ["id.rijksmuseum.nl", "iiif.micr.io"],
+    hostPathPrefixes: { "data.rijksmuseum.nl": ["/search/collection"], "id.rijksmuseum.nl": ["/"], "iiif.micr.io": ["/"] },
+    termsUrl: "https://data.rijksmuseum.nl/policy",
+  },
+  openverse: {
+    id: "openverse",
+    name: "Openverse",
+    documentedLimit: "anonymous: 20 requests/minute burst, 200 requests/day sustained (x-ratelimit headers); page_size <= 20",
+    minIntervalMs: 3000, // 20/min burst
+    apiHost: "api.openverse.org",
+    imageHosts: [],
+    hostPathPrefixes: { "api.openverse.org": ["/v1/images/"] },
+    termsUrl: "https://docs.openverse.org/terms_of_service.html",
+  },
 });
 const MUSEUM_IDS = Object.keys(MUSEUMS);
 const HOST_TO_MUSEUM = new Map();
@@ -69,6 +100,11 @@ const MIN_INTERVAL_FLOOR_MS = 50; // env overrides can slow us down, never below
 const MET_BASE = "https://collectionapi.metmuseum.org/public/collection";
 const CMA_BASE = "https://openaccess-api.clevelandart.org/api";
 const VAM_BASE = "https://api.vam.ac.uk/v2";
+const AIC_BASE = "https://api.artic.edu/api/v1";
+const AIC_IIIF_DEFAULT = "https://www.artic.edu/iiif/2";
+const RIJKS_SEARCH = "https://data.rijksmuseum.nl/search/collection";
+const RIJKS_ID_BASE = "https://id.rijksmuseum.nl";
+const OV_BASE = "https://api.openverse.org/v1";
 
 // Cleveland has no departments endpoint (404); this is Appendix B of its docs (v4.0.3, 2026-07-09).
 export const CMA_DEPARTMENTS = Object.freeze([
@@ -129,10 +165,12 @@ class Pacer {
 function envInterval(id, dflt) {
   const raw = process.env[`OPEN_ART_${id.toUpperCase()}_MIN_INTERVAL_MS`];
   const n = Number(raw);
-  if (raw && Number.isFinite(n)) return Math.max(MIN_INTERVAL_FLOOR_MS, Math.min(60_000, Math.floor(n)));
+  // Env overrides may only SLOW a museum down: never below its documented-limit default.
+  if (raw && Number.isFinite(n)) return Math.max(dflt, MIN_INTERVAL_FLOOR_MS, Math.min(60_000, Math.floor(n)));
   return dflt;
 }
 const pacers = Object.fromEntries(MUSEUM_IDS.map((id) => [id, new Pacer(id, envInterval(id, MUSEUMS[id].minIntervalMs))]));
+export function _envIntervalForTest(id) { return envInterval(id, MUSEUMS[id].minIntervalMs); }
 export function _setIntervalsForTest(ms) { for (const p of Object.values(pacers)) p.minIntervalMs = ms; }
 export function _pacerStats() { return Object.fromEntries(Object.entries(pacers).map(([k, p]) => [k, { ...p.stats, minIntervalMs: p.minIntervalMs }])); }
 
@@ -162,6 +200,14 @@ function checkUrl(u) {
   if (url.username || url.password) throw new ToolError("INVALID_URL", "Credentials in URLs are not allowed");
   const museum = HOST_TO_MUSEUM.get(url.hostname);
   if (!museum || (url.port && url.port !== "443")) throw new ToolError("HOST_NOT_ALLOWED", `Host not allowed: ${url.hostname}`);
+  const prefixes = MUSEUMS[museum].hostPathPrefixes?.[url.hostname];
+  if (prefixes) {
+    let decoded;
+    try { decoded = decodeURIComponent(url.pathname); } catch { decoded = null; }
+    if (!prefixes.some((pre) => url.pathname.startsWith(pre)) || /%(?:2f|5c|2e)/i.test(url.pathname) || decoded === null || decoded.split(/[\/\\]/).includes("..")) {
+      throw new ToolError("HOST_NOT_ALLOWED", `Path not allowed on ${url.hostname}`);
+    }
+  }
   return { url, museum };
 }
 
@@ -207,7 +253,7 @@ export async function httpGet(rawUrl, { ctx, accept = "application/json", maxByt
         method: "GET",
         redirect: "manual",
         signal: ac.signal,
-        headers: { "User-Agent": userAgent(), Accept: accept },
+        headers: museum === "aic" ? { "User-Agent": userAgent(), "AIC-User-Agent": userAgent(), Accept: accept } : { "User-Agent": userAgent(), Accept: accept },
       });
       log("GET", url.hostname + url.pathname, res.status, `${Date.now() - started}ms`);
       if ([301, 302, 303, 307, 308].includes(res.status)) {
@@ -235,7 +281,7 @@ export async function httpGet(rawUrl, { ctx, accept = "application/json", maxByt
       }
       if (res.status < 200 || res.status >= 300) {
         const snippet = (await readCapped(res, 2048, ac.signal).catch(() => Buffer.alloc(0))).toString("utf8").slice(0, 300);
-        const code = res.status === 404 ? "NOT_FOUND" : res.status === 410 ? "ENDPOINT_RETIRED" : res.status === 403 ? "FORBIDDEN" : res.status === 400 || res.status === 422 ? "UPSTREAM_REJECTED_INPUT" : "UPSTREAM_ERROR";
+        const code = res.status === 404 ? "NOT_FOUND" : res.status === 410 ? "ENDPOINT_RETIRED" : res.status === 403 ? "FORBIDDEN" : res.status === 400 || res.status === 401 || res.status === 422 ? "UPSTREAM_REJECTED_INPUT" : "UPSTREAM_ERROR";
         throw new ToolError(code, `${MUSEUMS[museum].name} returned HTTP ${res.status}`, { status: res.status, bodySnippet: snippet });
       }
       const body = await readCapped(res, maxBytes, ac.signal);
@@ -341,9 +387,17 @@ const RE_CMA_ID = /^(?:\d{1,9}|[0-9A-Za-z][0-9A-Za-z._-]{0,30})$/; // Athena id 
 const RE_VAM_ID = /^O[1-9]\d{0,11}$/; // V&A systemNumber, e.g. O9138
 const RE_VAM_THES = /^THES\d{1,9}$/;
 const RE_VAM_TERM = /^[A-Za-z]{1,6}\d{1,9}$/;
+const RE_AIC_ID = /^[1-9]\d{0,8}$/; // AIC artwork id, e.g. 27992
+const RE_AIC_IMAGE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const RE_AIC_DEPT = /^PC-\d{1,6}$/;
+const RE_RIJKS_LOD = /^[1-9]\d{4,11}$/; // Rijksmuseum LOD id, e.g. 200107928
+const RE_RIJKS_OBJNUM = /^[A-Z]{1,6}(?:-[A-Za-z0-9.]{1,20}){1,6}$/; // object number, e.g. SK-C-5, RP-P-2008-90 (no wildcards)
+const RE_RIJKS_ID = new RegExp(`(?:${RE_RIJKS_LOD.source})|(?:${RE_RIJKS_OBJNUM.source})`);
+const RE_RIJKS_TOKEN = /^[A-Za-z0-9_\-]{1,300}={0,2}$/;
+const RE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // ---------------------------------------------------------------------------
-// Normalisation: one record shape for all three museums
+// Normalisation: one record shape for all four museums
 // ---------------------------------------------------------------------------
 const stripHtml = (s) => String(s ?? "").replace(/<[^>]*>/g, " ").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#0?39;/g, "'").replace(/\s+/g, " ").trim();
 const clip = (s, n = LIMITS.maxTextChars) => { const t = stripHtml(s); return t ? (t.length > n ? t.slice(0, n - 1) + "…" : t) : null; };
@@ -501,6 +555,151 @@ export function normalizeVamRecord(j) {
   return rec;
 }
 
+// AIC: only is_public_domain === true is open access. Images are built from config.iiif_url + image_id
+// (IIIF Image API 2.0; AIC docs recommend 843px wide, 1686px is the largest size they generally serve).
+function aicIiifBase(cfg) {
+  const u = cfg && typeof cfg.iiif_url === "string" ? cfg.iiif_url.replace(/\/+$/, "") : "";
+  return /^https:\/\/www\.artic\.edu\/iiif\/2$/.test(u) ? u : AIC_IIIF_DEFAULT;
+}
+export function normalizeAic(o, cfg) {
+  const pd = o.is_public_domain === true;
+  const base = aicIiifBase(cfg);
+  const imgId = typeof o.image_id === "string" && RE_AIC_IMAGE_ID.test(o.image_id) ? o.image_id : null;
+  const iiif = (id, w) => `${base}/${id}/full/${w},/0/default.jpg`;
+  const lic = pd
+    ? licence({ museum: "aic", openAccess: true, status: "public-domain", label: "Public domain (Art Institute of Chicago is_public_domain; image CC0)", rights: o.copyright_notice })
+    : licence({ museum: "aic", openAccess: false, status: "restricted", label: "Not flagged public domain by the Art Institute of Chicago: reference only", rights: o.copyright_notice });
+  const alt = Array.isArray(o.alt_image_ids) ? o.alt_image_ids.filter((x) => typeof x === "string" && RE_AIC_IMAGE_ID.test(x)).slice(0, 5) : [];
+  return {
+    museum: "aic",
+    id: String(o.id),
+    title: nz(o.title),
+    artist: nz(o.artist_title) || nz(o.artist_display),
+    artistBio: nz(o.artist_display),
+    date: nz(o.date_display),
+    medium: nz(o.medium_display),
+    classification: nz(o.classification_title) || nz(o.artwork_type_title),
+    department: nz(o.department_title),
+    culture: nz(o.place_of_origin),
+    creditLine: nz(o.credit_line),
+    dimensions: nz(o.dimensions),
+    accessionNumber: nz(o.main_reference_number),
+    url: `https://www.artic.edu/artworks/${encodeURIComponent(String(o.id))}`,
+    tags: Array.isArray(o.term_titles) ? [...new Set(o.term_titles.filter((x) => typeof x === "string"))].slice(0, 20) : [],
+    description: clip(o.short_description || o.description),
+    license: lic,
+    images: imgId
+      ? { hasImage: true, web: iiif(imgId, 843), large: iiif(imgId, 1686), original: iiif(imgId, 1686), additional: alt.map((id) => iiif(id, 1686)) }
+      : { hasImage: false, web: null, large: null, original: null, additional: [] },
+  };
+}
+
+// --- Rijksmuseum (Linked Art JSON-LD from id.rijksmuseum.nl) ---
+const AAT = (n) => `http://vocab.getty.edu/aat/${n}`;
+const AAT_EN = AAT(300388277), AAT_NL = AAT(300388256);
+const hasClass = (x, n) => Array.isArray(x?.classified_as) && x.classified_as.some((c) => typeof c?.id === "string" && c.id.replace(/^https:/, "http:") === AAT(n));
+const isLang = (x, l) => Array.isArray(x?.language) && x.language.some((g) => g?.id === l);
+const notationEn = (x) => { const n = Array.isArray(x?.notation) ? x.notation : []; return (n.find((v) => v?.["@language"] === "en") || n[0])?.["@value"] || null; };
+function pickText(list, cls, extra) {
+  const c = (Array.isArray(list) ? list : []).filter((x) => typeof x?.content === "string" && hasClass(x, cls) && (!extra || extra(x)));
+  return (c.find((x) => isLang(x, AAT_EN)) || c.find((x) => isLang(x, AAT_NL)) || c[0])?.content || null;
+}
+const RIGHTS = [
+  [/^https?:\/\/creativecommons\.org\/publicdomain\/mark\/1\.0\/?$/i, "public-domain", "Public Domain Mark (Rijksmuseum image rights)"],
+  [/^https?:\/\/creativecommons\.org\/publicdomain\/zero\/1\.0\/?$/i, "CC0", "CC0 (Rijksmuseum image rights)"],
+];
+export function normalizeRijks(j) {
+  const lod = String(j?.id || "").replace(/^https:\/\/id\.rijksmuseum\.nl\//, "");
+  const objNum = (Array.isArray(j.identified_by) ? j.identified_by : []).find((x) => x?.type === "Identifier" && hasClass(x, 300312355))?.content || null;
+  const names = (Array.isArray(j.identified_by) ? j.identified_by : []).filter((x) => x?.type === "Name" && hasClass(x, 300404670));
+  const title = (names.find((x) => isLang(x, AAT_EN)) || names[0])?.content || null;
+  const pb = j.produced_by || {};
+  const parts = Array.isArray(pb.part) ? pb.part : [pb];
+  let makers = parts.flatMap((p) => (Array.isArray(p?.carried_out_by) ? p.carried_out_by : []).map(notationEn)).filter(Boolean);
+  if (!makers.length) makers = parts.map((p) => pickText(p?.referred_to_by, 300435417)).filter(Boolean);
+  const dateNames = Array.isArray(pb.timespan?.identified_by) ? pb.timespan.identified_by : [];
+  const date = (dateNames.find((x) => isLang(x, AAT_EN)) || dateNames[0])?.content || null;
+  let web = null, imgId = null, rightsUrl = null, rightsLabel = null;
+  for (const so of Array.isArray(j.subject_of) ? j.subject_of : []) {
+    for (const d of Array.isArray(so?.digitally_carried_by) ? so.digitally_carried_by : []) {
+      const ap = Array.isArray(d?.access_point) ? d.access_point.map((a) => a?.id).find((u) => typeof u === "string") : null;
+      if (!ap) continue;
+      const m = /^https:\/\/iiif\.micr\.io\/([A-Za-z0-9]{1,40})\//.exec(ap);
+      if (m && !imgId) {
+        imgId = m[1];
+        const r = (Array.isArray(d.referred_to_by) ? d.referred_to_by : []).find((x) => typeof x?.content === "string" && Array.isArray(x.classified_as) && x.classified_as.some((c) => /aat\/300460240$/.test(c?.id || "")));
+        rightsUrl = r?.content || null; rightsLabel = r?._label || null;
+      } else if (!web && d.format === "text/html" && /^https:\/\/www\.rijksmuseum\.nl\//.test(ap)) web = ap;
+    }
+  }
+  const hit = rightsUrl && imgId ? RIGHTS.find(([re]) => re.test(rightsUrl)) : null;
+  const rightsText = rightsUrl ? `${rightsLabel ? rightsLabel + ": " : ""}${rightsUrl}` : null;
+  const lic = hit
+    ? licence({ museum: "rijks", openAccess: true, status: hit[1], label: hit[2], rights: rightsText })
+    : licence({ museum: "rijks", openAccess: false, status: "restricted", label: imgId ? `Rijksmuseum image rights ${rightsLabel || rightsUrl || "unknown"}: not public domain / CC0, reference only` : "No Rijksmuseum image: reference only", rights: rightsText });
+  const iiif = (w) => `https://iiif.micr.io/${imgId}/full/${w}/0/default.jpg`;
+  return {
+    museum: "rijks",
+    id: /^\d+$/.test(lod) ? lod : String(j?.id || ""),
+    title: nz(title),
+    artist: makers.length ? [...new Set(makers)].join("; ") : null,
+    artistBio: null,
+    date: nz(date),
+    medium: pickText(j.referred_to_by, 300435429),
+    classification: (Array.isArray(j.classified_as) ? j.classified_as.map(notationEn).filter(Boolean) : []).join("; ") || null,
+    department: null,
+    culture: null,
+    creditLine: pickText(j.referred_to_by, 300026687),
+    dimensions: pickText(j.referred_to_by, 300435430),
+    accessionNumber: nz(objNum),
+    url: web,
+    tags: [],
+    description: clip(pickText(j.referred_to_by, 300435452)),
+    license: lic,
+    images: imgId ? { hasImage: true, web: iiif("843,"), large: iiif("1686,"), original: iiif("max"), additional: [] } : { hasImage: false, web: null, large: null, original: null, additional: [] },
+  };
+}
+
+// --- Openverse (aggregated openly licensed images; not a museum) ---
+const OV_OPEN = { cc0: ["CC0", "CC0 1.0 (Openverse)"], pdm: ["public-domain", "Public Domain Mark (Openverse)"] };
+export function normalizeOpenverse(o) {
+  const code = typeof o.license === "string" ? o.license.toLowerCase() : "";
+  const open = Object.prototype.hasOwnProperty.call(OV_OPEN, code);
+  const nice = code ? `${code === "pdm" ? "PDM" : code === "cc0" ? "CC0" : "CC " + code.toUpperCase()}${o.license_version ? " " + o.license_version : ""}` : "unknown licence";
+  const httpsOrNull = (u) => (typeof u === "string" && /^https:\/\//.test(u) ? u : null);
+  const thumb = typeof o.thumbnail === "string" && /^https:\/\/api\.openverse\.org\/v1\/images\/[0-9a-f-]{36}\/thumb\/$/i.test(o.thumbnail) ? o.thumbnail : null;
+  const full = httpsOrNull(o.url);
+  const extra = {
+    licenseCode: nz(code), licenseVersion: nz(o.license_version), licenseUrl: httpsOrNull(o.license_url),
+    creator: nz(o.creator), creatorUrl: httpsOrNull(o.creator_url), attribution: nz(o.attribution),
+    provider: nz(o.provider), source: nz(o.source),
+    requirement: open ? "No conditions; attribution appreciated." : `Reuse only under ${nice}: keep the attribution text${/nc/.test(code) ? ", non-commercial use only" : ""}${/nd/.test(code) ? ", no derivatives" : ""}${/sa/.test(code) ? ", share alike" : ""}.`,
+  };
+  if (!open) extra.reuse = "licence-conditions-apply";
+  return {
+    museum: "openverse",
+    id: String(o.id),
+    title: nz(o.title),
+    artist: nz(o.creator),
+    artistBio: null,
+    date: null,
+    medium: null,
+    classification: nz(o.category),
+    department: null,
+    culture: null,
+    creditLine: nz(o.attribution),
+    dimensions: Number.isInteger(o.width) && Number.isInteger(o.height) ? `${o.width} × ${o.height} px` : null,
+    accessionNumber: null,
+    url: httpsOrNull(o.foreign_landing_url),
+    tags: Array.isArray(o.tags) ? o.tags.map((t) => t?.name).filter((x) => typeof x === "string").slice(0, 20) : [],
+    description: null,
+    license: open
+      ? licence({ museum: "openverse", openAccess: true, status: OV_OPEN[code][0], label: OV_OPEN[code][1], rights: o.attribution, extra })
+      : licence({ museum: "openverse", openAccess: false, status: code ? "cc-licensed" : "unknown", label: `${nice}: not CC0/PDM, so not open access here; reusable only under the licence terms`, rights: o.attribution, extra }),
+    images: { hasImage: !!(thumb || full), web: thumb, large: full, original: full, additional: [] },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Museum clients
 // ---------------------------------------------------------------------------
@@ -528,9 +727,38 @@ async function vamGetObject(id, ctx) {
   return normalizeVamRecord(j);
 }
 
-const getByMuseum = { met: metGetObject, cleveland: cmaGetArtwork, vam: vamGetObject };
-const ID_RE = { met: RE_MET_ID, cleveland: RE_CMA_ID, vam: RE_VAM_ID };
-const ID_HINT = { met: "digits only, e.g. 436532", cleveland: "Athena id (digits) or accession number, e.g. 1958.39", vam: "V&A systemNumber like O9138" };
+const AIC_FIELDS = "id,title,artist_title,artist_display,date_display,medium_display,classification_title,artwork_type_title,department_title,place_of_origin,credit_line,dimensions,main_reference_number,is_public_domain,copyright_notice,image_id,alt_image_ids,short_description,description,term_titles";
+
+async function aicGetArtwork(id, ctx) {
+  const j = await getJson(`${AIC_BASE}/artworks/${id}?fields=${AIC_FIELDS}`, { ctx });
+  if (!j?.data || typeof j.data.id !== "number") throw new ToolError("UNEXPECTED_RESPONSE", "Unexpected Art Institute of Chicago artwork response");
+  return normalizeAic(j.data, j.config);
+}
+
+async function rijksResolve(id, ctx) {
+  if (RE_RIJKS_LOD.test(id)) return id;
+  const j = await getJson(`${RIJKS_SEARCH}?objectNumber=${encodeURIComponent(id)}`, { ctx, accept: "application/ld+json, application/json" });
+  const first = Array.isArray(j?.orderedItems) ? j.orderedItems.map((x) => x?.id).find((u) => typeof u === "string") : null;
+  const m = first && /^https:\/\/id\.rijksmuseum\.nl\/([1-9]\d{4,11})$/.exec(first);
+  if (!m) throw new ToolError("NOT_FOUND", `No Rijksmuseum object with object number ${id}`);
+  return m[1];
+}
+async function rijksFetchLod(lod, ctx) {
+  const j = await getJson(`${RIJKS_ID_BASE}/${lod}`, { ctx, accept: "application/ld+json, application/json" });
+  if (!j || j.type !== "HumanMadeObject" || typeof j.id !== "string") throw new ToolError("UNEXPECTED_RESPONSE", "Unexpected Rijksmuseum object response (not a HumanMadeObject)");
+  return normalizeRijks(j);
+}
+async function rijksGetObject(id, ctx) { return rijksFetchLod(await rijksResolve(id, ctx), ctx); }
+
+async function ovGetImage(id, ctx) {
+  const j = await getJson(`${OV_BASE}/images/${id.toLowerCase()}/`, { ctx });
+  if (!j || typeof j.id !== "string") throw new ToolError("UNEXPECTED_RESPONSE", "Unexpected Openverse image response");
+  return normalizeOpenverse(j);
+}
+
+const getByMuseum = { met: metGetObject, cleveland: cmaGetArtwork, vam: vamGetObject, aic: aicGetArtwork, rijks: rijksGetObject, openverse: ovGetImage };
+const ID_RE = { met: RE_MET_ID, cleveland: RE_CMA_ID, vam: RE_VAM_ID, aic: RE_AIC_ID, rijks: new RegExp(`^${RE_RIJKS_ID.source}$`), openverse: RE_UUID };
+const ID_HINT = { met: "digits only, e.g. 436532", cleveland: "Athena id (digits) or accession number, e.g. 1958.39", vam: "V&A systemNumber like O9138", aic: "digits only, e.g. 27992", rijks: "LOD id (digits, e.g. 200107928) or object number (e.g. SK-C-5)", openverse: "Openverse image UUID" };
 
 const CMA_SEARCH_FIELDS = "id,accession_number,share_license_status,title,creation_date,creators,technique,type,department,culture,creditline,measurements,url,images,copyright,description";
 
@@ -600,6 +828,69 @@ async function vamSearch(a, ctx) {
     museum: "vam", total: Number(j?.info?.record_count) || 0, page: Number(j?.info?.page) || a.page, pages: Number(j?.info?.pages) || 0, pageSize: a.pageSize,
     results: recs.map(normalizeVamSearchRecord),
     notes: ["V&A items are NEVER open access: reference only. API use is non-commercial personal/educational under V&A terms (s9)."],
+  };
+}
+
+async function aicSearch(a, ctx) {
+  if (a.q === undefined && a.departmentId === undefined) throw new ToolError("INVALID_INPUT", "Provide q or departmentId.");
+  if (a.page * a.limit > 10000) throw new ToolError("INVALID_INPUT", "page * limit may not exceed 10000 (AIC search result window)");
+  // Filters use AIC's Elasticsearch query DSL passed as bracketed GET params (documented "GET with query params").
+  const f = [];
+  if (a.openAccessOnly) f.push(["term", "is_public_domain", "true"]);
+  if (a.departmentId) f.push(["term", "department_id", a.departmentId]);
+  const p = new URLSearchParams();
+  if (a.q) p.set("q", a.q);
+  p.set("page", String(a.page)); p.set("limit", String(a.limit)); p.set("fields", AIC_FIELDS);
+  let i = 0;
+  for (const [kind, field, val] of f) { p.set(`query[bool][filter][${i}][${kind}][${field}]`, val); i++; }
+  if (a.hasImage) p.set(`query[bool][filter][${i}][exists][field]`, "image_id");
+  const j = await getJson(`${AIC_BASE}/artworks/search?${p.toString()}`, { ctx });
+  const data = Array.isArray(j?.data) ? j.data : [];
+  return {
+    museum: "aic", total: Number(j?.pagination?.total) || 0, page: a.page, limit: a.limit, totalPages: Number(j?.pagination?.total_pages) || 0,
+    results: data.map((o) => normalizeAic(o, j.config)),
+    notes: a.openAccessOnly ? [] : ["openAccessOnly=false: results may include works not flagged public domain (reference only)."],
+  };
+}
+
+const RIJKS_FILTERS = ["title", "creator", "description", "type", "material", "technique", "creationDate", "aboutActor"];
+async function rijksSearch(a, ctx) {
+  if (!RIJKS_FILTERS.some((k) => a[k] !== undefined) && a.pageToken === undefined) throw new ToolError("INVALID_INPUT", `Provide at least one of: ${RIJKS_FILTERS.join(", ")} (the Rijksmuseum search has no free-text q).`);
+  const p = new URLSearchParams();
+  for (const k of RIJKS_FILTERS) if (a[k] !== undefined) p.set(k, a[k]);
+  if (a.hasImage || a.openAccessOnly) p.set("imageAvailable", "true");
+  if (a.pageToken) p.set("pageToken", a.pageToken);
+  const j = await getJson(`${RIJKS_SEARCH}?${p.toString()}`, { ctx, accept: "application/ld+json, application/json" });
+  const ids = (Array.isArray(j?.orderedItems) ? j.orderedItems : []).map((x) => /^https:\/\/id\.rijksmuseum\.nl\/([1-9]\d{4,11})$/.exec(String(x?.id || ""))?.[1]).filter(Boolean);
+  const nextTok = (() => { try { const u = new URL(j?.next?.id); return u.hostname === "data.rijksmuseum.nl" ? u.searchParams.get("pageToken") : null; } catch { return null; } })();
+  const slice = ids.slice(a.offset, a.offset + a.limit);
+  const out = { museum: "rijks", total: Number(j?.partOf?.totalItems) || 0, pageIds: ids.length, offset: a.offset, limit: a.limit, nextPageToken: nextTok && RE_RIJKS_TOKEN.test(nextTok) ? nextTok : null, results: [], notes: [] };
+  let filtered = 0, skipped = 0;
+  for (const id of slice) {
+    try {
+      const rec = await rijksFetchLod(id, ctx);
+      if (a.openAccessOnly && !rec.license.openAccess) { filtered++; continue; }
+      out.results.push(rec);
+    } catch (e) { if (e instanceof ToolError && e.code === "NOT_FOUND") { skipped++; continue; } throw e; }
+  }
+  if (filtered) out.notes.push(`${filtered} result(s) were not public domain / CC0 and were hidden (openAccessOnly=true).`);
+  if (skipped) out.notes.push(`${skipped} id(s) could not be fetched (404).`);
+  out.notes.push("Each search page holds up to 100 ids; results hydrate ids[offset..offset+limit). Raise offset to continue within the page, then use nextPageToken.");
+  return out;
+}
+
+const OV_LICENSES = ["by", "by-nc", "by-nc-nd", "by-nc-sa", "by-nd", "by-sa", "cc0", "nc-sampling+", "pdm", "sampling+"];
+const OV_CATEGORIES = ["digitized_artwork", "illustration", "photograph"];
+async function ovSearch(a, ctx) {
+  const lic = a.openAccessOnly ? (a.licenses ? a.licenses.filter((x) => x === "cc0" || x === "pdm") : ["cc0", "pdm"]) : a.licenses;
+  if (a.openAccessOnly && lic.length === 0) throw new ToolError("INVALID_INPUT", "openAccessOnly=true allows only cc0 and pdm in licenses");
+  const url = `${OV_BASE}/images/?` + qs({ q: a.q, license: lic ? lic.join(",") : undefined, category: a.categories ? a.categories.join(",") : undefined, source: a.source, page: a.page, page_size: a.pageSize });
+  const j = await getJson(url, { ctx });
+  const res = Array.isArray(j?.results) ? j.results : [];
+  return {
+    museum: "openverse", total: Number(j?.result_count) || 0, page: Number(j?.page) || a.page, pageCount: Number(j?.page_count) || 0, pageSize: a.pageSize,
+    results: res.map(normalizeOpenverse),
+    notes: ["Openverse aggregates third-party images (Flickr, Wikimedia, museums...). Always show license.attribution. Anonymous quota: 20 req/min, 200 req/day.", ...(a.openAccessOnly ? [] : ["openAccessOnly=false: CC BY/BY-SA/NC/ND results need attribution and may restrict use (see license.requirement)."])],
   };
 }
 
@@ -753,10 +1044,67 @@ def("oa_vam_list_collections", "List V&A facets with counts: collections (defaul
   return { museum: "vam", type: a.type, terms: arr.slice(0, a.limit).map((t) => ({ id: t.id, value: t.value, count: t.count })) };
 }, { title: "List V&A collections/facets" });
 
+// --- Art Institute of Chicago ---
+def("oa_aic_search", "Search the Art Institute of Chicago API (/artworks/search). Only items AIC flags is_public_domain are open access; images come from AIC's IIIF server. AIC throttles anonymous use to 60 requests/minute, so requests are paced at 1/s." + LICENCE_NOTE, {
+  q: S.str("Search text."),
+  departmentId: S.str("AIC department id, e.g. PC-10 (see oa_aic_list_departments).", { pattern: RE_AIC_DEPT, hint: "PC- + digits", max: 9 }),
+  openAccessOnly: OA,
+  hasImage: HAS_IMG,
+  page: S.int("Page number, starting at 1 (page*limit <= 10000).", { min: 1, max: 10000, default: 1 }),
+  limit: S.int("Page size 1-100 (default 10).", { min: 1, max: 100, default: 10 }),
+}, [], aicSearch, { title: "Search the Art Institute of Chicago" });
+
+def("oa_aic_get_artwork", "Get one Art Institute of Chicago artwork by numeric id (e.g. 27992). Normalized, with licence and IIIF image URLs." + LICENCE_NOTE, {
+  id: S.str("AIC artwork id, digits only.", { pattern: RE_AIC_ID, hint: ID_HINT.aic, max: 9 }),
+}, ["id"], async (a, ctx) => ({ museum: "aic", result: await aicGetArtwork(a.id, ctx) }), { title: "Get an AIC artwork" });
+
+def("oa_aic_list_departments", "List Art Institute of Chicago departments (id + title) for the departmentId filter in oa_aic_search.", {}, [], async (a, ctx) => {
+  const j = await getJson(`${AIC_BASE}/departments?limit=100&fields=id,title`, { ctx });
+  const list = Array.isArray(j?.data) ? j.data.filter((d) => typeof d?.id === "string").map((d) => ({ departmentId: d.id, title: d.title })) : [];
+  return { museum: "aic", departments: list };
+}, { title: "List AIC departments" });
+
+// --- Rijksmuseum ---
+const RTXT = (d) => S.str(d, { max: 100 });
+def("oa_rijks_search", "Search the Rijksmuseum collection (data.rijksmuseum.nl Linked Art Search; no key). The search returns ids only (100 per page); this tool hydrates `limit` of them from the Linked Open Data resolver. Open access = image rights are Public Domain Mark or CC0. No free-text q: use title/creator/description etc. (Dutch or English terms)." + LICENCE_NOTE, {
+  title: RTXT("Title words, e.g. Night Watch."),
+  creator: RTXT("Creator name, e.g. Rembrandt van Rijn."),
+  description: RTXT("Keywords in the object description."),
+  type: RTXT("Object type, e.g. painting, print."),
+  material: RTXT("Material, e.g. canvas."),
+  technique: RTXT("Technique, e.g. etching."),
+  creationDate: S.str("Year or wildcard period, e.g. 1642 or 16??.", { max: 9, pattern: /^[0-9?*-]{1,9}$/, hint: "digits with ? or * wildcards" }),
+  aboutActor: RTXT("Person/group depicted or about."),
+  openAccessOnly: OA,
+  hasImage: HAS_IMG,
+  offset: S.int("Offset within the current 100-id page (default 0).", { min: 0, max: 99, default: 0 }),
+  limit: S.int("Objects to hydrate, 1-10 (default 5; one request each).", { min: 1, max: 10, default: 5 }),
+  pageToken: S.str("nextPageToken from a previous call.", { max: 300, pattern: RE_RIJKS_TOKEN, hint: "opaque token from nextPageToken" }),
+}, [], rijksSearch, { title: "Search the Rijksmuseum" });
+
+def("oa_rijks_get_object", "Get one Rijksmuseum object by LOD id (digits, e.g. 200107928) or object number (e.g. SK-C-5). Normalized from Linked Art, with image rights and IIIF image URLs." + LICENCE_NOTE, {
+  id: S.str("LOD id or object number.", { pattern: ID_RE.rijks, hint: ID_HINT.rijks, max: 60 }),
+}, ["id"], async (a, ctx) => ({ museum: "rijks", result: await rijksGetObject(a.id, ctx) }), { title: "Get a Rijksmuseum object" });
+
+// --- Openverse ---
+def("oa_openverse_search", "Search Openverse (api.openverse.org, anonymous) for openly licensed images. Every result carries license code/version/URL, creator and the ready-made attribution text. Only CC0 and PDM count as open access; other CC licences are returned with license.reuse='licence-conditions-apply' and a license.requirement. Anonymous limits: 20 req/min, 200 req/day, page_size <= 20." + LICENCE_NOTE, {
+  q: S.str("Search text (max 200 chars).", { max: 200 }),
+  openAccessOnly: S.bool("Only CC0 and Public Domain Mark (default true).", { default: true }),
+  licenses: S.arr("Licence codes to include (with openAccessOnly=true only cc0/pdm are kept).", OV_LICENSES, { maxItems: 10 }),
+  categories: S.arr("Image categories.", OV_CATEGORIES, { maxItems: 3 }),
+  source: S.str("Comma-separated Openverse source names, e.g. flickr,wikimedia.", { max: 100, pattern: /^[a-z0-9_]{1,40}(?:,[a-z0-9_]{1,40}){0,5}$/, hint: "lowercase source names, comma separated" }),
+  page: S.int("Page number from 1.", { min: 1, max: 50, default: 1 }),
+  pageSize: S.int("Results per page 1-20 (anonymous cap 20, default 10).", { min: 1, max: 20, default: 10 }),
+}, ["q"], ovSearch, { title: "Search Openverse" });
+
+def("oa_openverse_get_image", "Get one Openverse image by UUID, with licence, licence URL, creator and attribution text." + LICENCE_NOTE, {
+  id: S.str("Openverse image UUID.", { pattern: RE_UUID, hint: ID_HINT.openverse, max: 36 }),
+}, ["id"], async (a, ctx) => ({ museum: "openverse", result: await ovGetImage(a.id, ctx) }), { title: "Get an Openverse image" });
+
 // --- Cross-museum ---
-def("oa_search_all", "Search The Met, Cleveland and the V&A at once and return one normalized, interleaved list. With openAccessOnly=true (default) the V&A is skipped because none of its items are open access; set openAccessOnly=false to include V&A as reference-only results." + LICENCE_NOTE, {
+def("oa_search_all", "Search The Met, Cleveland, the Art Institute of Chicago, the Rijksmuseum (title match), Openverse and the V&A at once and return one normalized, interleaved list. With openAccessOnly=true (default) the V&A is skipped because none of its items are open access; set openAccessOnly=false to include V&A as reference-only results." + LICENCE_NOTE, {
   q: S.str("Search text.", { max: 200 }),
-  museums: S.arr("Museums to search (default all).", MUSEUM_IDS, { maxItems: 3 }),
+  museums: S.arr("Museums to search (default all).", MUSEUM_IDS, { maxItems: 6 }),
   openAccessOnly: OA,
   hasImage: HAS_IMG,
   limitPerMuseum: S.int("Results per museum, 1-10 (default 5).", { min: 1, max: 10, default: 5 }),
@@ -770,7 +1118,13 @@ def("oa_search_all", "Search The Met, Cleveland and the V&A at once and return o
       ? () => metSearch({ q: a.q, hasImage: a.hasImage, openAccessOnly: a.openAccessOnly, hydrate: true, offset: 0, limit: a.limitPerMuseum }, ctx)
       : m === "cleveland"
         ? () => cmaSearch({ q: a.q, hasImage: a.hasImage, openAccessOnly: a.openAccessOnly, skip: 0, limit: a.limitPerMuseum }, ctx)
-        : () => vamSearch({ q: a.q, hasImage: a.hasImage, page: 1, pageSize: a.limitPerMuseum }, ctx);
+        : m === "aic"
+          ? () => aicSearch({ q: a.q, hasImage: a.hasImage, openAccessOnly: a.openAccessOnly, page: 1, limit: a.limitPerMuseum }, ctx)
+          : m === "rijks"
+            ? () => rijksSearch({ title: a.q.slice(0, 100), hasImage: a.hasImage, openAccessOnly: a.openAccessOnly, offset: 0, limit: a.limitPerMuseum }, ctx)
+            : m === "openverse"
+              ? () => ovSearch({ q: a.q, openAccessOnly: a.openAccessOnly, page: 1, pageSize: a.limitPerMuseum }, ctx)
+              : () => vamSearch({ q: a.q, hasImage: a.hasImage, page: 1, pageSize: a.limitPerMuseum }, ctx);
     jobs.push(run().then((r) => ({ m, r }), (e) => ({ m, e })));
   }
   const settled = await Promise.all(jobs);
@@ -783,7 +1137,7 @@ def("oa_search_all", "Search The Met, Cleveland and the V&A at once and return o
   for (let i = 0; lists.some((l) => i < l.length); i++) for (const l of lists) if (i < l.length) out.results.push(l[i]);
   out.notes.push("Met totals count matches before the open-access filter. Use the per-museum tools to page.");
   return out;
-}, { title: "Search all three museums" });
+}, { title: "Search all sources" });
 
 // --- Image helper ---
 const SIZES = ["web", "large", "original"];
@@ -796,8 +1150,8 @@ function pickImage(rec, size) {
 
 def("oa_best_image_url", "Return the best image URL for one object WITHOUT downloading anything. By default only open-access (public domain / CC0) items return a URL; otherwise `url` is null and the licence explains why. Pass requireOpenAccess=false to get reference-only URLs (do not reuse those).", {
   museum: S.enm("Museum.", MUSEUM_IDS),
-  id: S.str("Object id: Met objectID (digits), Cleveland Athena id/accession number, or V&A systemNumber (O + digits).", { max: 31 }),
-  size: S.enm("web = ~web size, large = print size (default), original = largest published (Cleveland 'full' is a huge TIFF).", SIZES, { default: "large" }),
+  id: S.str("Object id: Met objectID (digits), Cleveland Athena id/accession number, V&A systemNumber (O + digits), AIC artwork id (digits), Rijksmuseum LOD id/object number, or Openverse UUID.", { max: 60 }),
+  size: S.enm("web = ~web size, large = print size (default), original = largest published (Cleveland 'full' is a huge TIFF; AIC web=843px, large/original=1686px IIIF; Rijksmuseum web 843px, large 1686px, original = max IIIF; Openverse web = Openverse thumbnail, large/original = the provider's file).", SIZES, { default: "large" }),
   requireOpenAccess: S.bool("Only return a URL when the museum flags the item open access (default true).", { default: true }),
 }, ["museum", "id"], async (a, ctx) => {
   if (!ID_RE[a.museum].test(a.id)) throw new ToolError("INVALID_INPUT", `id has an invalid format for ${a.museum} (${ID_HINT[a.museum]})`);
@@ -814,14 +1168,15 @@ def("oa_best_image_url", "Return the best image URL for one object WITHOUT downl
 
 // --- Download (the only tool that writes, and only local files) ---
 def("oa_download_image", "Download ONE open-access (public domain / CC0) image to a directory you specify. Refuses anything that is not flagged open access (so never the V&A). Dry-run by default: call once without confirm to see exactly what would be written, then again with confirm=true. Writes the image plus a small <name>.license.json provenance file; never overwrites; max 10 MB unless maxMegabytes is raised (<= 50).", {
-  museum: S.enm("Museum (met or cleveland).", ["met", "cleveland"]),
-  id: S.str("Met objectID (digits) or Cleveland Athena id/accession number.", { max: 31 }),
+  museum: S.enm("Museum (met, cleveland, aic, rijks or openverse).", ["met", "cleveland", "aic", "rijks", "openverse"]),
+  id: S.str("Met objectID, Cleveland id/accession number, AIC id, Rijksmuseum LOD id/object number, or Openverse UUID.", { max: 60 }),
   directory: S.str("Absolute destination directory. No '..', no dot-directories, not a system directory, not the home directory itself. Created if missing.", { max: 1024 }),
   size: S.enm("web or large (default web). 'original' is not downloadable here.", ["web", "large"], { default: "web" }),
   maxMegabytes: S.int("Size cap in MB (default 10, max 50).", { min: 1, max: LIMITS.maxDownloadMegabytesCeiling, default: 10 }),
   confirm: S.bool("Set true to actually write the files. Default false = dry run.", { default: false }),
 }, ["museum", "id", "directory"], async (a, ctx) => {
   if (!ID_RE[a.museum].test(a.id)) throw new ToolError("INVALID_INPUT", `id has an invalid format for ${a.museum} (${ID_HINT[a.museum]})`);
+  if (a.museum === "openverse" && a.size !== "web") throw new ToolError("INVALID_INPUT", "Openverse downloads use size=web (the Openverse thumbnail service); full-size files live on third-party hosts outside the allow-list. Use oa_best_image_url for the original URL.");
   const dir = validateDownloadDir(a.directory);
   const rec = await getByMuseum[a.museum](a.id, ctx);
   if (!rec.license.openAccess) throw new ToolError("NOT_OPEN_ACCESS", "Refusing to download: the museum does not flag this item as open access (public domain / CC0). Reference only.", { license: rec.license });
@@ -859,7 +1214,7 @@ def("oa_status", "Show server version, per-museum pacing and counters, caps, and
   name: SERVER_NAME, version: VERSION, userAgent: userAgent(),
   caps: { httpTimeoutMs: Math.min(timeoutMs(), LIMITS.httpTimeoutMs), maxResponseBytes: LIMITS.maxResponseBytes, maxDownloadMegabytes: LIMITS.maxDownloadMegabytesCeiling, toolDeadlineMs: LIMITS.toolDeadlineMs },
   museums: Object.fromEntries(MUSEUM_IDS.map((id) => [id, { name: MUSEUMS[id].name, documentedLimit: MUSEUMS[id].documentedLimit, minIntervalMs: pacers[id].minIntervalMs, stats: pacers[id].stats, termsUrl: MUSEUMS[id].termsUrl }])),
-  licencePolicy: "Direct reuse only when license.openAccess=true (Met public domain flag, Cleveland share_license_status=CC0). Everything else, including every V&A item, is reference only.",
+  licencePolicy: "Direct reuse only when license.openAccess=true (Met public domain flag, Cleveland share_license_status=CC0, AIC is_public_domain, Rijksmuseum image rights PDM/CC0, Openverse licence cc0/pdm). Openverse items under other CC licences (BY, BY-SA, NC, ND) may be reused only under those licence terms with the given attribution. Everything else, including every V&A item, is reference only.",
   downloadRoot: process.env.OPEN_ART_DOWNLOAD_ROOT ? "restricted by OPEN_ART_DOWNLOAD_ROOT" : "unrestricted apart from path validation",
 }), { title: "Server status and limits", openWorld: false });
 
@@ -890,7 +1245,7 @@ export async function callTool(name, args) {
 // JSON-RPC / MCP
 // ---------------------------------------------------------------------------
 const SUPPORTED_PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
-const INSTRUCTIONS = "Read-only open-access museum search (The Met, Cleveland Museum of Art, V&A). Only items with license.openAccess=true (Met public domain, Cleveland CC0) may be reused directly; every other item, including all V&A items, is reference only. No keys needed. Requests are paced per museum.";
+const INSTRUCTIONS = "Read-only open-access art search (The Met, Cleveland Museum of Art, Art Institute of Chicago, Rijksmuseum, V&A, plus Openverse). Only items with license.openAccess=true (Met public domain, Cleveland CC0, AIC is_public_domain, Rijksmuseum PDM/CC0 image rights, Openverse CC0/PDM) may be reused directly; Openverse items under other CC licences only under their licence terms with attribution; every other item, including all V&A items, is reference only. No keys needed. Requests are paced per museum.";
 
 export async function handleRpc(msg) {
   // returns a response object, or null for notifications

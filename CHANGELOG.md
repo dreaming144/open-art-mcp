@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.0
+
+- Added the Rijksmuseum (data.rijksmuseum.nl Search API + id.rijksmuseum.nl Linked Art resolver, keyless): `oa_rijks_search`, `oa_rijks_get_object`. Open access only when the image rights statement is the Public Domain Mark or CC0 (metadata CC0 is ignored for gating). IIIF images from `iiif.micr.io`.
+- Added Openverse (api.openverse.org v1, anonymous), Verified live (30/30 live smoke checks passed on 2026-10-21 after earlier timeouts on 2026-10-20); new searches can be slow. Tools: `oa_openverse_search`, `oa_openverse_get_image`. Only `cc0`/`pdm` are open access; all results carry licence code, version, URL, creator, attribution and a reuse requirement. Pacing 3000 ms (anonymous 20/min burst, 200/day).
+- Both are in `oa_search_all`, `oa_best_image_url` and `oa_download_image` (Openverse downloads use the Openverse thumbnail only). 20 tools total.
+- 401 from upstream maps to `UPSTREAM_REJECTED_INPUT`. Offline fixtures (trimmed live responses) live in `server/fixtures/`.
+- Tests: selftest 68 offline checks; live smoke 26 checks (28 with `--download`) plus 2 Openverse checks (SKIP when Openverse times out).
+
+## 0.2.0
+
+- Added the Art Institute of Chicago (public API v1, keyless): 3 new tools, `oa_aic_search`, `oa_aic_get_artwork`, `oa_aic_list_departments` (16 tools total).
+- AIC is in `oa_search_all`, `oa_best_image_url` and `oa_download_image`. Only `is_public_domain: true` counts as open access.
+- AIC images are IIIF URLs built from the response's `config.iiif_url` (must be `https://www.artic.edu/iiif/2`) plus `image_id`: web 843px, large/original 1686px.
+- Allow-list: `api.artic.edu`, and `www.artic.edu` restricted to `/iiif/2/` paths.
+- Pacing for AIC is 1000 ms (AIC documents 60 requests/minute for anonymous users). Every AIC request sends an `AIC-User-Agent` header, as AIC's docs ask.
+- `OPEN_ART_*_MIN_INTERVAL_MS` can now only slow a museum down; a value below the museum's default pacing is clamped up to it.
+- AIC IIIF paths containing encoded `%2f`, `%5c` or `%2e` (any case), or anything that decodes to a `..` segment, are refused.
+- Tests: selftest now runs 57 offline checks; live smoke runs 22 (plus 1 with `--download`).
+
 ## 0.1.0
 
 Initial release.
