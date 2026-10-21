@@ -1,0 +1,23 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "open-art-mcp",
+  "version": "0.1.0",
+  "description": "Read-only open-access museum search for The Met, Cleveland Museum of Art and the V&A. Normalized results with a licence field on every item (public domain / CC0 flag, rights text, image URLs). No keys.",
+  "author": {
+    "name": "Chris R"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/dreaming144/open-art-mcp",
+  "homepage": "https://github.com/dreaming144/open-art-mcp",
+  "keywords": [
+    "art",
+    "museum",
+    "public-domain",
+    "cc0",
+    "open-access",
+    "metropolitan-museum",
+    "cleveland-museum-of-art",
+    "victoria-and-albert-museum",
+    "mcp"
+  ]
+}
